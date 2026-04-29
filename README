@@ -2,6 +2,10 @@ Name: ehman
 Date: 2026-04-29
 Environment: Linux, gcc
 
+=========================================================
+CS 4760 Assignment 6 - Memory Management
+=========================================================
+
 How to compile:
   make
 
@@ -16,9 +20,126 @@ Options:
   -i fraction   Min fraction-of-second between launches (default 0.5)
   -f logfile    Log file name (default oss.log)
 
-Generative AI used: Claude (Anthropic)
-Prompts:
-  Build Project 6 incrementally starting from Project 5 base
+Example:
+  ./oss -n 3 -s 2 -t 4 -i 0.6 -f log.txt
 
-Summary: Used Claude to build incrementally, testing each
-step before moving to the next.
+=========================================================
+Design Decisions
+=========================================================
+
+IPC Keys
+--------
+Both oss and user_proc derive IPC keys using ftok("oss.c", 1)
+for shared memory and ftok("oss.c", 2) for the message queue.
+Using the source file as the ftok path guarantees unique keys
+per user on the shared opsys server, since each user's oss.c
+has a different inode number.
+
+Memory Layout
+-------------
+- Total system memory: 64K
+- Frame size: 1K
+- Total frames: 64
+- Pages per process: 16 (each process has 16K address space)
+- Page size: 1K
+
+Each process has a page table of 16 entries. Each entry is
+either -1 (page not in memory) or the frame number where
+that page is currently loaded.
+
+Frame Table
+-----------
+64 frame descriptors, each containing:
+  - occupied: 1 if frame is in use, 0 if free
+  - dirty:    1 if frame has been written to, 0 if clean
+  - pid:      PID of the process owning this frame
+  - page:     which page of that process is in this frame
+
+FIFO Page Replacement
+---------------------
+When a page fault occurs and no free frame is available,
+the oldest frame (first in, first out) is evicted. A queue
+tracks the order frames were loaded. The evicted frame's
+owner has its page table entry cleared. If the evicted
+frame has its dirty bit set, an additional 14ms is added
+to the clock to simulate writing the dirty page to disk
+before loading the new page.
+
+Page Fault Handling
+-------------------
+When a page fault occurs:
+  1. OSS finds a free frame or evicts via FIFO
+  2. The new page is loaded into the frame
+  3. The process is blocked for 14ms (disk I/O time)
+  4. OSS does NOT send a reply message — process stays
+     blocked in msgrcv until the I/O time has elapsed
+  5. OSS checks blocked processes each iteration and
+     sends the grant message when the time is reached
+
+If all processes are blocked simultaneously, OSS advances
+the clock directly to the earliest unblock time to avoid
+spinning indefinitely (soft deadlock prevention).
+
+Page Hit Handling
+-----------------
+When a requested page is already in a frame:
+  - Clock advances by 100ns
+  - If write: dirty bit is set on the frame
+  - Grant message sent immediately
+
+Message Protocol
+----------------
+oss -> user_proc:  address == 1  your turn
+                   address == 0  terminate now
+
+user_proc -> oss:  address >= 0  memory request
+                   rwFlag  == 0  read
+                   rwFlag  == 1  write
+                   address == -1 terminating
+
+Memory addresses are generated randomly in range
+0 to (16 * 1024 - 1). Page is extracted by dividing
+address by 1024. Bias is 80% reads, 20% writes.
+
+Termination
+-----------
+oss stops after opt_n processes launched or 5 real-time
+seconds (SIGALRM). Uses sigaction with no SA_RESTART so
+msgrcv() is interrupted by the alarm. On SIGINT/SIGTERM
+all children are killed and IPC is cleaned up.
+
+Log Output
+----------
+All output goes to both stdout and the log file. Log
+writing stops at 10,000 lines. Every 500ms simulated
+time the process table is printed. Every 1 second the
+full memory map (frame table + page tables) is printed.
+
+Statistics (final report)
+--------------------------
+  - Total processes launched
+  - Total memory reads
+  - Total memory writes
+  - Total page faults
+  - Page fault percentage
+
+=========================================================
+Generative AI Use
+=========================================================
+
+Generative AI used: Claude (Anthropic, claude.ai)
+
+Prompts (paraphrased):
+  1. Build Project 6 incrementally starting from Project 5 base
+  2. Set up shared.h with frame table and page table structures
+  3. Add main loop with forking and basic memory request logging
+  4. Add page table and frame table logic with FIFO replacement
+  5. Add dirty bit tracking and page fault blocking
+  6. Add all-blocked detection to prevent soft deadlock
+
+Summary: Claude was used to build the project incrementally,
+verifying each step before moving to the next. The most
+valuable contributions were the FIFO queue implementation,
+the page fault blocking mechanism, and the soft deadlock
+prevention when all processes are simultaneously blocked
+waiting on disk I/O.
