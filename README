@@ -1,0 +1,24 @@
+Name: ehman
+Date: 2026-04-29
+Environment: Linux, gcc
+
+How to compile:
+  make
+
+How to run:
+  ./oss -n 5 -s 5 -t 3 -i 0.1 -f oss.log
+
+Options:
+  -h            Print help and exit
+  -n proc       Total processes to launch (default 18)
+  -s simul      Max simultaneous processes (default 18, hard cap 18)
+  -t timeLim    Max simulated seconds a child exists (default 5)
+  -i fraction   Min fraction-of-second between launches (default 0.5)
+  -f logfile    Log file name (default oss.log)
+
+Generative AI used: Claude (Anthropic)
+Prompts:
+  Build Project 6 incrementally starting from Project 5 base
+
+Summary: Used Claude to build incrementally, testing each
+step before moving to the next.
