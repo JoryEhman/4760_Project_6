@@ -4,6 +4,12 @@
  * Date: 2026-04-29
  * Environment: Linux, gcc
  * Description: OSS memory management simulator (Project 6)
+ *
+ * Page replacement: FIFO
+ * - Each process has 16 pages (1K each)
+ * - System has 64 frames (64K total)
+ * - Page fault blocks process for 14ms (disk I/O time)
+ * - Dirty bit set on writes, adds extra time on swap-out
  */
 
 #include <stdio.h>
@@ -22,6 +28,12 @@
 
 /* ── Round-robin index ───────────────────────────────────────────────────── */
 static int lastScheduled = 0;
+
+/* ── FIFO queue for frame replacement ───────────────────────────────────── */
+static int fifoQueue[TOTAL_FRAMES];  /* stores frame indices in FIFO order */
+static int fifoHead = 0;
+static int fifoTail = 0;
+static int fifoCount = 0;
 
 /* ── Globals ─────────────────────────────────────────────────────────────── */
 SimClock *simClock = NULL;
@@ -99,6 +111,134 @@ static int countActive(void) {
     for (int i = 0; i < MAX_PROCS; i++)
         if (processTable[i].occupied) count++;
     return count;
+}
+
+/* ── FIFO queue helpers ──────────────────────────────────────────────────── */
+static void fifoEnqueue(int frame) {
+    fifoQueue[fifoTail] = frame;
+    fifoTail = (fifoTail + 1) % TOTAL_FRAMES;
+    fifoCount++;
+}
+
+static int fifoDequeue(void) {
+    if (fifoCount == 0) return -1;
+    int frame = fifoQueue[fifoHead];
+    fifoHead = (fifoHead + 1) % TOTAL_FRAMES;
+    fifoCount--;
+    return frame;
+}
+
+/* ── Find a free frame ───────────────────────────────────────────────────── */
+static int findFreeFrame(void) {
+    for (int f = 0; f < TOTAL_FRAMES; f++)
+        if (!frameTable[f].occupied) return f;
+    return -1;
+}
+
+/* ── Release all frames held by a process ───────────────────────────────── */
+static void releaseFrames(int slot) {
+    for (int f = 0; f < TOTAL_FRAMES; f++) {
+        if (frameTable[f].occupied &&
+            frameTable[f].pid == processTable[slot].pid) {
+            frameTable[f].occupied = 0;
+            frameTable[f].dirty    = 0;
+            frameTable[f].pid      = -1;
+            frameTable[f].page     = -1;
+        }
+    }
+    for (int p = 0; p < PAGES_PER_PROC; p++)
+        processTable[slot].pageTable[p] = -1;
+}
+
+/*
+ * ── Handle a memory request ───────────────────────────────────────────────
+ * Returns 1 if granted immediately, 0 if page fault (process blocked)
+ */
+static int handleMemoryRequest(int slot, int address, int rwFlag) {
+    int page  = address / PAGE_SIZE;
+    int frame = processTable[slot].pageTable[page];
+
+    if (frame != -1) {
+        /* ── Page hit ── */
+        if (rwFlag == 1) {
+            frameTable[frame].dirty = 1;
+            logWrite("OSS: Address %d in frame %d, writing data"
+                     " to frame at %u:%09u\n",
+                     address, frame,
+                     simClock->seconds, simClock->nanoseconds);
+        } else {
+            logWrite("OSS: Address %d in frame %d, giving data to P%d"
+                     " at %u:%09u\n",
+                     address, frame, slot,
+                     simClock->seconds, simClock->nanoseconds);
+        }
+        advanceClock(NO_FAULT_TIME_NS);
+        return 1;  /* granted immediately */
+
+    } else {
+        /* ── Page fault ── */
+        totalPageFaults++;
+        logWrite("OSS: Address %d is not in a frame, page fault\n", address);
+
+        /* Find a free frame or evict via FIFO */
+        int newFrame = findFreeFrame();
+
+        if (newFrame == -1) {
+            /* No free frame — evict the oldest via FIFO */
+            newFrame = fifoDequeue();
+
+            /* Find which process/page owns this frame and clear it */
+            int evictPid  = frameTable[newFrame].pid;
+            int evictPage = frameTable[newFrame].page;
+
+            /* Find the slot of the evicted process */
+            for (int i = 0; i < MAX_PROCS; i++) {
+                if (processTable[i].occupied &&
+                    processTable[i].pid == evictPid) {
+                    processTable[i].pageTable[evictPage] = -1;
+                    break;
+                }
+            }
+
+            logWrite("OSS: Clearing frame %d and swapping in P%d page %d\n",
+                     newFrame, slot, page);
+
+            if (frameTable[newFrame].dirty) {
+                logWrite("OSS: Dirty bit of frame %d set,"
+                         " adding additional time to clock\n", newFrame);
+                advanceClock(DISK_RW_TIME_NS);  /* extra time for dirty write */
+            }
+        } else {
+            logWrite("OSS: Using free frame %d for P%d page %d\n",
+                     newFrame, slot, page);
+        }
+
+        /* Load the new page into the frame */
+        frameTable[newFrame].occupied = 1;
+        frameTable[newFrame].dirty    = (rwFlag == 1) ? 1 : 0;
+        frameTable[newFrame].pid      = processTable[slot].pid;
+        frameTable[newFrame].page     = page;
+        processTable[slot].pageTable[page] = newFrame;
+
+        /* Add to FIFO queue */
+        fifoEnqueue(newFrame);
+
+        /* Block the process for disk I/O time */
+        unsigned long long unblockNs =
+            (unsigned long long)simClock->seconds * BILLION +
+            simClock->nanoseconds + DISK_RW_TIME_NS;
+
+        processTable[slot].blocked     = 1;
+        processTable[slot].unblockSec  = (int)(unblockNs / BILLION);
+        processTable[slot].unblockNano = (int)(unblockNs % BILLION);
+
+        logWrite("OSS: P%d blocked until %d:%09d\n",
+                 slot,
+                 processTable[slot].unblockSec,
+                 processTable[slot].unblockNano);
+
+        return 0;  /* page fault — process blocked */
+    }
 }
 
 /* ── Launch a child ──────────────────────────────────────────────────────── */
@@ -253,6 +393,11 @@ int main(int argc, char *argv[]) {
         frameTable[f].page     = -1;
     }
 
+    /* Initialize FIFO queue */
+    fifoHead  = 0;
+    fifoTail  = 0;
+    fifoCount = 0;
+
     logWrite("OSS: Starting. n=%d s=%d t=%d i=%.2f logfile=%s\n",
              n, s, t, i_val, logfile);
 
@@ -291,6 +436,55 @@ int main(int argc, char *argv[]) {
         nowNs = (unsigned long long)simClock->seconds * BILLION +
                 simClock->nanoseconds;
 
+        /* ── Check if any blocked process can now be unblocked ── */
+        for (int i = 0; i < MAX_PROCS; i++) {
+            if (!processTable[i].occupied) continue;
+            if (!processTable[i].blocked)  continue;
+
+            unsigned long long unblockNs =
+                (unsigned long long)processTable[i].unblockSec * BILLION +
+                processTable[i].unblockNano;
+
+            if (nowNs >= unblockNs) {
+                processTable[i].blocked = 0;
+                logWrite("OSS: P%d unblocked at %u:%09u\n",
+                         i, simClock->seconds, simClock->nanoseconds);
+
+                /* Send grant message to unblocked process */
+                msgbuffer grant;
+                grant.mtype   = (long)processTable[i].pid;
+                grant.address = 1;
+                grant.rwFlag  = 0;
+                msgsnd(msqid, &grant,
+                       sizeof(msgbuffer) - sizeof(long), 0);
+            }
+        }
+
+        /* ── If all processes blocked, advance clock to next unblock ── */
+        int allBlocked = 1;
+        for (int i = 0; i < MAX_PROCS; i++) {
+            if (processTable[i].occupied && !processTable[i].blocked) {
+                allBlocked = 0;
+                break;
+            }
+        }
+        if (allBlocked && countActive() > 0) {
+            /* Find earliest unblock time and jump to it */
+            unsigned long long earliest = (unsigned long long)-1;
+            for (int i = 0; i < MAX_PROCS; i++) {
+                if (!processTable[i].occupied) continue;
+                unsigned long long t2 =
+                    (unsigned long long)processTable[i].unblockSec * BILLION +
+                    processTable[i].unblockNano;
+                if (t2 < earliest) earliest = t2;
+            }
+            if (earliest != (unsigned long long)-1 && earliest > nowNs) {
+                unsigned int jump = (unsigned int)(earliest - nowNs);
+                advanceClock(jump);
+                nowNs = earliest;
+            }
+        }
+
         /* ── Schedule one unblocked process (round-robin) ── */
         int scheduled = 0;
         for (int count = 0; count < MAX_PROCS && !scheduled; count++) {
@@ -324,6 +518,9 @@ int main(int argc, char *argv[]) {
                          i, processTable[i].pid,
                          simClock->seconds, simClock->nanoseconds);
 
+                /* Release all frames held by this process */
+                releaseFrames(i);
+
                 waitpid(processTable[i].pid, NULL, 0);
                 processTable[i].occupied = 0;
 
@@ -347,16 +544,19 @@ int main(int argc, char *argv[]) {
                              simClock->seconds, simClock->nanoseconds);
                 }
 
-                /* For now just grant everything and advance clock by 100ns */
-                advanceClock(NO_FAULT_TIME_NS);
+                int granted = handleMemoryRequest(i, addr, rw);
 
-                /* Send grant back */
-                msgbuffer grant;
-                grant.mtype   = (long)processTable[i].pid;
-                grant.address = 1;
-                grant.rwFlag  = 0;
-                msgsnd(msqid, &grant,
-                       sizeof(msgbuffer) - sizeof(long), 0);
+                if (granted) {
+                    /* Send grant back immediately */
+                    msgbuffer grant;
+                    grant.mtype   = (long)processTable[i].pid;
+                    grant.address = 1;
+                    grant.rwFlag  = 0;
+                    msgsnd(msqid, &grant,
+                           sizeof(msgbuffer) - sizeof(long), 0);
+                }
+                /* If not granted (page fault), process stays blocked
+                 * and will be unblocked by the check above */
             }
         }
 
